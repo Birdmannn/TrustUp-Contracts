@@ -1,4 +1,5 @@
 use crate::{CreditLineContract, CreditLineContractClient, LoanStatus, RepaymentInstallment};
+use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Events, Ledger},
@@ -18,6 +19,16 @@ impl MockReputation {
     pub fn decrease_score(_env: Env, _updater: Address, _user: Address, _amount: u32) {
         // Does nothing, just needs to exist for the call to succeed
     }
+
+    pub fn increase_score(_env: Env, _updater: Address, _user: Address, _amount: u32) {}
+}
+
+#[contract]
+pub struct MockLiquidityPool;
+
+#[contractimpl]
+impl MockLiquidityPool {
+    pub fn receive_repayment(_env: Env, _from: Address, _amount: i128, _fee: i128) {}
 }
 
 // A mock reputation contract that always returns a score below the threshold.
@@ -46,6 +57,8 @@ struct TestCtx {
     client: CreditLineContractClient<'static>,
     admin: Address,
     rep_id: Address,
+    token_id: Address,
+    lp_id: Address,
 }
 
 impl TestCtx {
@@ -62,20 +75,30 @@ impl TestCtx {
         let admin = Address::generate(&env);
         let rep_id = env.register(MockReputation, ());
         let merchant_registry = Address::generate(&env);
-        let liquidity_pool = Address::generate(&env);
+        let lp_id = env.register(MockLiquidityPool, ());
 
-        client.initialize(&admin, &rep_id, &merchant_registry, &liquidity_pool);
+        let token_admin = Address::generate(&env);
+        let token_id = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+        client.initialize(&admin, &rep_id, &merchant_registry, &lp_id, &token_id);
 
         TestCtx {
             env,
             client,
             admin,
             rep_id,
+            token_id,
+            lp_id,
         }
     }
 
     /// Build a single-installment repayment schedule with the given due date.
-    fn single_installment(&self, amount: i128, due_date: u64) -> soroban_sdk::Vec<RepaymentInstallment> {
+    fn single_installment(
+        &self,
+        amount: i128,
+        due_date: u64,
+    ) -> soroban_sdk::Vec<RepaymentInstallment> {
         let mut schedule = soroban_sdk::Vec::new(&self.env);
         schedule.push_back(RepaymentInstallment { amount, due_date });
         schedule
@@ -85,12 +108,19 @@ impl TestCtx {
     fn create_default_loan(&self, user: &Address, merchant: &Address) -> u64 {
         let due_date = self.env.ledger().timestamp() + 10_000;
         let schedule = self.single_installment(1000, due_date);
-        self.client.create_loan(user, merchant, &1000, &200, &schedule)
+        self.client
+            .create_loan(user, merchant, &1000, &200, &schedule)
     }
 
     /// Advance ledger timestamp past the given due date so a loan is overdue.
     fn advance_past(&self, due_date: u64) {
         self.env.ledger().set_timestamp(due_date + 1);
+    }
+
+    /// Mint `amount` tokens to `address` so repayments don't fail on insufficient balance.
+    fn mint(&self, to: &Address, amount: i128) {
+        let asset_client = StellarAssetClient::new(&self.env, &self.token_id);
+        asset_client.mint(to, &amount);
     }
 }
 
@@ -106,12 +136,14 @@ fn test_initialize() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     assert_eq!(client.get_admin(), admin);
@@ -130,12 +162,14 @@ fn test_initialize_twice_fails() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env); // add this
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Try to initialize again - should panic
@@ -144,6 +178,7 @@ fn test_initialize_twice_fails() {
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 }
 
@@ -166,12 +201,14 @@ fn test_get_loan_not_found() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Try to get a loan that doesn't exist
@@ -191,12 +228,14 @@ fn test_set_admin() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     assert_eq!(client.get_admin(), admin);
@@ -220,12 +259,14 @@ fn test_set_reputation_contract() {
     let new_reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Update reputation contract address
@@ -247,12 +288,14 @@ fn test_set_merchant_registry() {
     let merchant_registry = Address::generate(&env);
     let new_merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Update merchant registry address
@@ -274,12 +317,14 @@ fn test_set_liquidity_pool() {
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
     let new_liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Update liquidity pool address
@@ -305,12 +350,14 @@ fn test_create_loan_with_zero_total_amount() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -334,12 +381,14 @@ fn test_create_loan_with_negative_total_amount() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -363,12 +412,14 @@ fn test_create_loan_with_zero_guarantee_amount() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -392,12 +443,14 @@ fn test_create_loan_with_insufficient_guarantee_19_percent() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -421,12 +474,14 @@ fn test_create_loan_with_insufficient_guarantee_10_percent() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -476,12 +531,14 @@ fn test_loan_counter_increments() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Note: We can't actually create loans without a reputation contract
@@ -504,12 +561,14 @@ fn test_create_loan_with_one_less_than_minimum_guarantee() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -532,12 +591,14 @@ fn test_multiple_contract_address_updates() {
     let reputation_contract_3 = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract_1,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     // Update reputation contract multiple times
@@ -562,12 +623,14 @@ fn test_create_loan_with_positive_total_negative_guarantee() {
     let reputation_contract = Address::generate(&env);
     let merchant_registry = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &reputation_contract,
         &merchant_registry,
         &liquidity_pool,
+        &token,
     );
 
     let repayment_schedule = soroban_sdk::Vec::new(&env);
@@ -591,12 +654,14 @@ fn test_mark_defaulted_success() {
     let user = Address::generate(&env);
     let merchant = Address::generate(&env);
     let liquidity_pool = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &rep_id, // Pass the Mock ID
         &Address::generate(&env),
         &liquidity_pool,
+        &token,
     );
 
     // Set a baseline time
@@ -635,12 +700,14 @@ fn test_mark_defaulted_too_early_fails() {
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &rep_id,
         &Address::generate(&env),
         &Address::generate(&env),
+        &token,
     );
 
     let current_time = 10000;
@@ -685,7 +752,9 @@ fn test_create_loan_stores_correct_fields() {
     let due_date = 15000_u64;
     let schedule = t.single_installment(1000, due_date);
 
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
     let loan = t.client.get_loan(&loan_id);
 
     assert_eq!(loan.loan_id, loan_id);
@@ -706,7 +775,9 @@ fn test_create_loan_exactly_20_percent_guarantee() {
     let merchant = Address::generate(&t.env);
     let schedule = t.single_installment(1000, 99999);
 
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
     let loan = t.client.get_loan(&loan_id);
     assert_eq!(loan.guarantee_amount, 200);
 }
@@ -719,7 +790,9 @@ fn test_create_loan_with_more_than_20_percent_guarantee() {
     let merchant = Address::generate(&t.env);
     let schedule = t.single_installment(1000, 99999);
 
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &500, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &500, &schedule);
     let loan = t.client.get_loan(&loan_id);
     assert_eq!(loan.status, LoanStatus::Active);
 }
@@ -731,11 +804,22 @@ fn test_create_loan_with_multi_installment_schedule() {
     let merchant = Address::generate(&t.env);
 
     let mut schedule = soroban_sdk::Vec::new(&t.env);
-    schedule.push_back(RepaymentInstallment { amount: 334, due_date: 10000 });
-    schedule.push_back(RepaymentInstallment { amount: 333, due_date: 20000 });
-    schedule.push_back(RepaymentInstallment { amount: 333, due_date: 30000 });
+    schedule.push_back(RepaymentInstallment {
+        amount: 334,
+        due_date: 10000,
+    });
+    schedule.push_back(RepaymentInstallment {
+        amount: 333,
+        due_date: 20000,
+    });
+    schedule.push_back(RepaymentInstallment {
+        amount: 333,
+        due_date: 30000,
+    });
 
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
     let loan = t.client.get_loan(&loan_id);
 
     assert_eq!(loan.repayment_schedule.len(), 3);
@@ -758,16 +842,21 @@ fn test_create_loan_rejected_when_reputation_below_threshold() {
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
     let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
 
     client.initialize(
         &admin,
         &low_rep_id,
         &Address::generate(&env),
         &Address::generate(&env),
+        &token,
     );
 
     let mut schedule = soroban_sdk::Vec::new(&env);
-    schedule.push_back(RepaymentInstallment { amount: 1000, due_date: 99999 });
+    schedule.push_back(RepaymentInstallment {
+        amount: 1000,
+        due_date: 99999,
+    });
 
     // Score is 49 — below 50 minimum → InsufficientReputation (error 4)
     client.create_loan(&user, &merchant, &1000, &200, &schedule);
@@ -796,7 +885,10 @@ fn test_create_loan_emits_loan_created_event() {
 
     // At least one event was emitted
     let events = t.env.events().all();
-    assert!(!events.is_empty(), "Expected a LoanCreated event to be emitted");
+    assert!(
+        !events.is_empty(),
+        "Expected a LoanCreated event to be emitted"
+    );
 }
 
 #[test]
@@ -807,13 +899,18 @@ fn test_mark_defaulted_emits_loan_defaulted_event() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     t.client.mark_defaulted(&loan_id);
 
     let events = t.env.events().all();
-    assert!(!events.is_empty(), "Expected a LoanDefaulted event to be emitted");
+    assert!(
+        !events.is_empty(),
+        "Expected a LoanDefaulted event to be emitted"
+    );
 }
 
 // ─── default flow ─────────────────────────────────────────────────────────────
@@ -827,7 +924,9 @@ fn test_mark_defaulted_on_already_defaulted_loan_fails() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     t.client.mark_defaulted(&loan_id);
@@ -851,7 +950,9 @@ fn test_default_flow_loan_status_becomes_defaulted() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     let before = t.client.get_loan(&loan_id);
     assert_eq!(before.status, LoanStatus::Active);
@@ -871,7 +972,9 @@ fn test_default_flow_preserves_loan_amounts() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     t.client.mark_defaulted(&loan_id);
@@ -892,7 +995,9 @@ fn test_mark_defaulted_at_exactly_due_date_boundary() {
     t.env.ledger().set_timestamp(1000);
     let due_date = 5000_u64;
     let schedule = t.single_installment(1000, due_date);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     // Set timestamp to exactly the due date — mark_defaulted should fail (LoanNotOverdue)
     t.env.ledger().set_timestamp(due_date);
@@ -910,7 +1015,9 @@ fn test_mark_defaulted_one_second_past_due_succeeds() {
     t.env.ledger().set_timestamp(1000);
     let due_date = 5000_u64;
     let schedule = t.single_installment(1000, due_date);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.env.ledger().set_timestamp(due_date + 1);
     t.client.mark_defaulted(&loan_id);
@@ -929,16 +1036,30 @@ fn test_default_flow_uses_last_installment_for_overdue_check() {
     t.env.ledger().set_timestamp(1000);
 
     let mut schedule = soroban_sdk::Vec::new(&t.env);
-    schedule.push_back(RepaymentInstallment { amount: 400, due_date: 3000 }); // already past
-    schedule.push_back(RepaymentInstallment { amount: 300, due_date: 6000 }); // already past
-    schedule.push_back(RepaymentInstallment { amount: 300, due_date: 10000 }); // last
+    schedule.push_back(RepaymentInstallment {
+        amount: 400,
+        due_date: 3000,
+    }); // already past
+    schedule.push_back(RepaymentInstallment {
+        amount: 300,
+        due_date: 6000,
+    }); // already past
+    schedule.push_back(RepaymentInstallment {
+        amount: 300,
+        due_date: 10000,
+    }); // last
 
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     // Past first two but not the last — should still fail (LoanNotOverdue)
     t.env.ledger().set_timestamp(7000);
     let result = t.client.try_mark_defaulted(&loan_id);
-    assert!(result.is_err(), "Not overdue until past the last installment");
+    assert!(
+        result.is_err(),
+        "Not overdue until past the last installment"
+    );
 
     // Now past the last installment — should succeed
     t.env.ledger().set_timestamp(10001);
@@ -959,7 +1080,9 @@ fn test_mark_defaulted_triggers_reputation_slash() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     // This succeeds only if the `slash` cross-contract call is executed without error
@@ -1018,36 +1141,37 @@ fn test_admin_can_update_all_contract_addresses() {
 // Remove #[ignore] and implement the function when working on Phase 4.
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
 fn test_partial_repayment_reduces_remaining_balance() {
     let t = TestCtx::setup();
     let user = Address::generate(&t.env);
     let merchant = Address::generate(&t.env);
     let loan_id = t.create_default_loan(&user, &merchant);
 
-    // TODO: t.client.repay(&user, &loan_id, &500);
+    t.mint(&user, 1000);
+
+    t.client.repay_loan(&user, &loan_id, &500);
     let loan = t.client.get_loan(&loan_id);
     assert_eq!(loan.remaining_balance, 500);
     assert_eq!(loan.status, LoanStatus::Active);
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
 fn test_full_repayment_sets_status_to_paid() {
     let t = TestCtx::setup();
     let user = Address::generate(&t.env);
     let merchant = Address::generate(&t.env);
     let loan_id = t.create_default_loan(&user, &merchant);
 
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.mint(&user, 1000);
+
+    t.client.repay_loan(&user, &loan_id, &1000);
     let loan = t.client.get_loan(&loan_id);
     assert_eq!(loan.remaining_balance, 0);
     assert_eq!(loan.status, LoanStatus::Paid);
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
-#[should_panic(expected = "Error(Contract, #9)")] // InvalidAmount
+#[should_panic(expected = "Error(Contract, #13)")] // InvalidAmount
 fn test_overpayment_is_rejected() {
     let t = TestCtx::setup();
     let user = Address::generate(&t.env);
@@ -1055,13 +1179,12 @@ fn test_overpayment_is_rejected() {
     let loan_id = t.create_default_loan(&user, &merchant);
 
     // Paying more than remaining_balance should panic with InvalidAmount
-    // TODO: t.client.repay(&user, &loan_id, &1001);
+    t.client.repay_loan(&user, &loan_id, &1001);
     let _ = loan_id;
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
-#[should_panic(expected = "Error(Contract, #8)")] // NotBorrower
+#[should_panic(expected = "Error(Contract, #14)")] // NotBorrower
 fn test_unauthorized_repayment_is_rejected() {
     let t = TestCtx::setup();
     let user = Address::generate(&t.env);
@@ -1070,12 +1193,11 @@ fn test_unauthorized_repayment_is_rejected() {
     let loan_id = t.create_default_loan(&user, &merchant);
 
     // A different address trying to repay the loan must fail with NotBorrower
-    // TODO: t.client.repay(&intruder, &loan_id, &200);
+    t.client.repay_loan(&intruder, &loan_id, &200);
     let _ = (loan_id, intruder);
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
 #[should_panic(expected = "Error(Contract, #7)")] // LoanNotActive
 fn test_repayment_on_non_active_loan_is_rejected() {
     let t = TestCtx::setup();
@@ -1084,13 +1206,15 @@ fn test_repayment_on_non_active_loan_is_rejected() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     t.client.mark_defaulted(&loan_id);
 
     // Attempting to repay a Defaulted loan must fail with LoanNotActive
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
     let _ = loan_id;
 }
 
@@ -1102,7 +1226,7 @@ fn test_full_repayment_triggers_reputation_increase() {
     let merchant = Address::generate(&t.env);
     let loan_id = t.create_default_loan(&user, &merchant);
 
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
     // Expect a cross-contract call to reputation contract's increase_score
     let _ = loan_id;
 }
@@ -1117,11 +1241,13 @@ fn test_early_repayment_triggers_bonus_reputation_increase() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 10000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     // Pay early (timestamp 2000, well before due date 10000)
     t.env.ledger().set_timestamp(2000);
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
     // Expect a larger reputation bonus than a standard on-time repayment
     let _ = loan_id;
 }
@@ -1184,7 +1310,7 @@ fn test_repayment_credited_to_liquidity_pool() {
     let user = Address::generate(&t.env);
     let merchant = Address::generate(&t.env);
     let loan_id = t.create_default_loan(&user, &merchant);
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
     // Verify MockLiquidityPool::receive_repayment was called
     let _ = loan_id;
 }
@@ -1199,7 +1325,9 @@ fn test_guarantee_transferred_to_pool_on_default() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     t.advance_past(5000);
     t.client.mark_defaulted(&loan_id);
@@ -1230,7 +1358,9 @@ fn test_complete_lifecycle_create_then_default() {
 
     t.env.ledger().set_timestamp(1000);
     let schedule = t.single_installment(1000, 5000);
-    let loan_id = t.client.create_loan(&user, &merchant, &1000, &200, &schedule);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
 
     let created = t.client.get_loan(&loan_id);
     assert_eq!(created.status, LoanStatus::Active);
@@ -1259,8 +1389,12 @@ fn test_multiple_independent_loans_do_not_interfere() {
     let schedule_a = t.single_installment(1000, 5000);
     let schedule_b = t.single_installment(2000, 8000);
 
-    let loan_a = t.client.create_loan(&user_a, &merchant, &1000, &200, &schedule_a);
-    let loan_b = t.client.create_loan(&user_b, &merchant, &2000, &400, &schedule_b);
+    let loan_a = t
+        .client
+        .create_loan(&user_a, &merchant, &1000, &200, &schedule_a);
+    let loan_b = t
+        .client
+        .create_loan(&user_b, &merchant, &2000, &400, &schedule_b);
 
     // Default loan_a only
     t.advance_past(5000);
@@ -1275,7 +1409,6 @@ fn test_multiple_independent_loans_do_not_interfere() {
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
 fn test_complete_lifecycle_create_repay_complete() {
     // Verifies the full happy path: Active → repaid in full → Paid
     let t = TestCtx::setup();
@@ -1284,10 +1417,12 @@ fn test_complete_lifecycle_create_repay_complete() {
 
     let loan_id = t.create_default_loan(&user, &merchant);
 
+    t.mint(&user, 1000);
+
     let active = t.client.get_loan(&loan_id);
     assert_eq!(active.status, LoanStatus::Active);
 
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
 
     let paid = t.client.get_loan(&loan_id);
     assert_eq!(paid.status, LoanStatus::Paid);
@@ -1295,7 +1430,6 @@ fn test_complete_lifecycle_create_repay_complete() {
 }
 
 #[test]
-#[ignore = "repay() not yet implemented — Phase 4"]
 fn test_multi_contract_integration_full_flow() {
     // End-to-end: reputation check on create → funding → repayment → score boost
     let t = TestCtx::setup();
@@ -1305,8 +1439,10 @@ fn test_multi_contract_integration_full_flow() {
     // 1. Create loan — reputation validated, pool funded
     let loan_id = t.create_default_loan(&user, &merchant);
 
+    t.mint(&user, 1000);
+
     // 2. Repay in full — pool credited, reputation score increased
-    // TODO: t.client.repay(&user, &loan_id, &1000);
+    t.client.repay_loan(&user, &loan_id, &1000);
 
     let loan = t.client.get_loan(&loan_id);
     assert_eq!(loan.status, LoanStatus::Paid);
@@ -1314,4 +1450,128 @@ fn test_multi_contract_integration_full_flow() {
     // TODO: assert reputation score increased for `user`
     // TODO: assert liquidity pool received the repayment
     let _ = loan_id;
+}
+
+// ─── repayment — repay_loan implementation tests ─────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // LoanNotActive
+fn test_repayment_on_defaulted_loan_is_rejected() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+
+    t.env.ledger().set_timestamp(1000);
+    let schedule = t.single_installment(1000, 5000);
+    let loan_id = t
+        .client
+        .create_loan(&user, &merchant, &1000, &200, &schedule);
+
+    t.advance_past(5000);
+    t.client.mark_defaulted(&loan_id);
+
+    // Loan is now Defaulted — repayment must fail
+    t.client.repay_loan(&user, &loan_id, &1000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // LoanNotActive
+fn test_repayment_on_already_paid_loan_is_rejected() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.mint(&user, 1002);
+
+    // Pay in full first
+    t.client.repay_loan(&user, &loan_id, &1000);
+
+    // Second repayment attempt must fail — loan is now Paid
+    t.client.repay_loan(&user, &loan_id, &1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // InvalidRepaymentAmount
+fn test_zero_repayment_amount_is_rejected() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.client.repay_loan(&user, &loan_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // InvalidRepaymentAmount
+fn test_negative_repayment_amount_is_rejected() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.client.repay_loan(&user, &loan_id, &-100);
+}
+
+#[test]
+fn test_multiple_partial_repayments_accumulate_correctly() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.mint(&user, 1000);
+
+    // Three partial payments: 300 + 300 + 400 = 1000
+    t.client.repay_loan(&user, &loan_id, &300);
+    t.client.repay_loan(&user, &loan_id, &300);
+    let remaining = t.client.repay_loan(&user, &loan_id, &400);
+
+    assert_eq!(remaining, 0);
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Paid);
+    assert_eq!(loan.remaining_balance, 0);
+}
+
+#[test]
+fn test_repay_loan_emits_event() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.mint(&user, 1000);
+
+    t.client.repay_loan(&user, &loan_id, &500);
+
+    let events = t.env.events().all();
+    assert!(
+        !events.is_empty(),
+        "Expected a LoanRepaid event to be emitted"
+    );
+}
+
+#[test]
+fn test_partial_repayment_does_not_trigger_reputation_increase() {
+    // Partial payment must leave status Active — no reputation call expected
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+    let loan_id = t.create_default_loan(&user, &merchant);
+
+    t.mint(&user, 1000);
+
+    t.client.repay_loan(&user, &loan_id, &500);
+
+    let loan = t.client.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Active); // still active, no score change
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // LoanNotFound
+fn test_repayment_on_nonexistent_loan_fails() {
+    let t = TestCtx::setup();
+    let user = Address::generate(&t.env);
+
+    t.client.repay_loan(&user, &999, &500);
 }
